@@ -300,26 +300,48 @@ class TestRustServerExtension(CustomTestCase):
             ],
         )
 
-    def test_gather_server_endpoints_rejects_a_loopback_host_across_nodes(self):
-        """A multi-node launch whose listener address only this machine can
-        reach fails before the collective, on every rank."""
-        all_gather_object = Mock()
+    def test_gather_server_endpoints_warns_on_a_loopback_host_across_nodes(self):
+        """A multi-node launch with a loopback listener and a routable
+        rendezvous is warned about, naming both addresses, and still runs the
+        collective: the nodes may share the machine. A loopback rendezvous
+        (two nodes on one CI host) is not warned about."""
+        all_gather_object = Mock(return_value=[None, None])
         parallel = SimpleNamespace(
             nnodes=2,
+            dist_init_addr="10.0.0.1:29500",
             world_group=SimpleNamespace(all_gather_object=all_gather_object),
         )
-        for host in ("127.0.0.1", "localhost", "::1", "[::1]"):
-            with (
-                patch.object(server_module, "get_parallel", return_value=parallel),
-                patch.object(
-                    server_module,
-                    "get_serving",
-                    return_value=SimpleNamespace(host=host, port=30000),
-                ),
-            ):
-                with self.assertRaisesRegex(ValueError, "not reachable"):
-                    RustServer.gather_server_endpoints(hosts_listener=False)
-        all_gather_object.assert_not_called()
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+            ),
+            self.assertLogs(server_module.logger, level="WARNING") as logs,
+        ):
+            self.assertEqual(
+                RustServer.gather_server_endpoints(hosts_listener=False), []
+            )
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("'127.0.0.1'", logs.output[0])
+        self.assertIn("'10.0.0.1:29500'", logs.output[0])
+
+        parallel.dist_init_addr = "127.0.0.1:29500"
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="127.0.0.1", port=30000),
+            ),
+            patch.object(server_module.logger, "warning") as warning,
+        ):
+            self.assertEqual(
+                RustServer.gather_server_endpoints(hosts_listener=False), []
+            )
+        warning.assert_not_called()
+        self.assertEqual(all_gather_object.call_count, 2)
 
     def test_startup_time_takes_the_engine_shape(self):
         """The frontend's end-to-end phase runs from its process's spawn."""
