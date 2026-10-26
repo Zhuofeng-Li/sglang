@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, TextInput};
+use sglang_processor::EncodedPrompt;
 use thiserror::Error;
 
 use crate::message::types::OneOrMany;
@@ -36,6 +37,8 @@ pub enum ChatFormatter {
     /// [`takes_content_parts`]).
     HuggingFace(PromptFormatter, bool),
     Legacy(Box<LegacyFormatter>),
+    /// DeepSeek-V4 / V4.1 through deepseek-recipe, which encodes its own prompt ids.
+    DeepSeek(sglang_processor::ChatFormatter),
 }
 
 impl ChatFormatter {
@@ -61,7 +64,29 @@ impl ChatFormatter {
                     })
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request),
+            ChatFormatter::DeepSeek(formatter) => formatter
+                .render_request(recipe_request(request, kwargs), &HashMap::new())
+                .map(|(prompt, _)| prompt.into_text())
+                .map_err(|error| TemplateError::Renderer {
+                    message: error.to_string(),
+                }),
         }
+    }
+
+    /// The prompt ids and images of formatters that encode their own prompts.
+    pub(super) fn encode(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+    ) -> Option<Result<EncodedPrompt, TemplateError>> {
+        let ChatFormatter::DeepSeek(formatter) = self else {
+            return None;
+        };
+        let encoded = formatter
+            .encode_multimodal_request(recipe_request(request, kwargs), &HashMap::new())?;
+        Some(encoded.map_err(|error| TemplateError::Renderer {
+            message: error.to_string(),
+        }))
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -70,7 +95,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(..) => None,
+            ChatFormatter::HuggingFace(..) | ChatFormatter::DeepSeek(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -113,6 +138,18 @@ fn join_text_parts(
         messages: serde_json::from_value(messages).map_err(renderer_error)?,
         ..request.clone()
     })
+}
+
+/// The SGLang request body deepseek-recipe renders: the wire request plus its kwargs.
+fn recipe_request(
+    request: &CreateChatCompletionRequest,
+    kwargs: Option<&ChatTemplateKwargs>,
+) -> serde_json::Value {
+    let mut body = serde_json::to_value(request).unwrap_or_default();
+    if let Some(kwargs) = kwargs {
+        body["chat_template_kwargs"] = serde_json::json!(kwargs);
+    }
+    body
 }
 
 /// The wire request plus its `chat_template_kwargs`, which the protocol type
