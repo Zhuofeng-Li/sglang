@@ -32,7 +32,9 @@ pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 /// conversation template.
 #[derive(Clone)]
 pub enum ChatFormatter {
-    HuggingFace(PromptFormatter),
+    /// The `bool` is whether the template takes content-part lists (see
+    /// [`takes_content_parts`]).
+    HuggingFace(PromptFormatter, bool),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -44,11 +46,20 @@ impl ChatFormatter {
         kwargs: Option<&ChatTemplateKwargs>,
     ) -> Result<String, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter)) => formatter
-                .render(&TemplateRequest { request, kwargs })
-                .map_err(|error| TemplateError::Renderer {
-                    message: error.to_string(),
-                }),
+            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter), content_parts) => {
+                let joined;
+                let request = if *content_parts {
+                    joined = join_text_parts(request)?;
+                    &joined
+                } else {
+                    request
+                };
+                formatter
+                    .render(&TemplateRequest { request, kwargs })
+                    .map_err(|error| TemplateError::Renderer {
+                        message: error.to_string(),
+                    })
+            }
             ChatFormatter::Legacy(formatter) => formatter.render(request),
         }
     }
@@ -59,10 +70,49 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(..) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
+}
+
+/// Python `detect_jinja_template_content_format`'s shortcut: a template naming
+/// media takes content-part lists (the "openai" format). Its AST check for other
+/// templates that iterate `message['content']` is not ported.
+pub(super) fn takes_content_parts(template: &str) -> bool {
+    ["image", "audio", "video", "vision"]
+        .iter()
+        .any(|keyword| template.contains(keyword))
+}
+
+/// Python hands such a template an all-text part list as is, and those templates
+/// (Qwen-VL, Qwen3.5) concatenate the parts. Dynamo would join them with
+/// newlines, so concatenate them here first.
+fn join_text_parts(
+    request: &CreateChatCompletionRequest,
+) -> Result<CreateChatCompletionRequest, TemplateError> {
+    let renderer_error = |error: serde_json::Error| TemplateError::Renderer {
+        message: error.to_string(),
+    };
+    let mut messages = serde_json::to_value(&request.messages).map_err(renderer_error)?;
+    for content in (messages.as_array_mut().into_iter().flatten())
+        .filter_map(|message| message.get_mut("content"))
+    {
+        if let Some(parts) = content
+            .as_array()
+            .filter(|parts| !parts.is_empty() && parts.iter().all(|part| part["type"] == "text"))
+        {
+            *content = parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<String>()
+                .into();
+        }
+    }
+    Ok(CreateChatCompletionRequest {
+        messages: serde_json::from_value(messages).map_err(renderer_error)?,
+        ..request.clone()
+    })
 }
 
 /// The wire request plus its `chat_template_kwargs`, which the protocol type
@@ -742,7 +792,7 @@ mod tests {
         };
 
         let formatter = load(Some(config), Some("deepseek_v4"), None).unwrap();
-        assert!(matches!(formatter, ChatFormatter::HuggingFace(_)));
+        assert!(matches!(formatter, ChatFormatter::HuggingFace(..)));
         let kwargs = HashMap::from([("thinking".into(), serde_json::json!(false))]);
         assert_eq!(
             formatter.render(&request(), Some(&kwargs)).unwrap(),
@@ -750,7 +800,7 @@ mod tests {
         );
         assert!(matches!(
             load(None, Some("deepseek_v4"), None),
-            Ok(ChatFormatter::HuggingFace(_))
+            Ok(ChatFormatter::HuggingFace(..))
         ));
 
         // A template, `--chat-template`, or an unknown architecture wins.
@@ -769,5 +819,36 @@ mod tests {
             load(None, None, None),
             Err(TemplateError::MissingConfig)
         ));
+    }
+
+    /// Qwen2.5-VL's template iterates content parts, so Python keeps them and the
+    /// template concatenates the text parts: `One.Two.`, not Dynamo's `One.\nTwo.`.
+    #[test]
+    fn multimodal_template_concatenates_text_parts() {
+        let template = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}<|vision_start|><|image_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        let config = temp_config(&serde_json::json!({ "chat_template": template }).to_string());
+        let formatter =
+            load_chat_formatter(Some(config.to_str().unwrap()), None, None, None).unwrap();
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "text", "text": "Describe."},
+                ]},
+                {"role": "assistant", "content": "A cat."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "One."},
+                    {"type": "text", "text": "Two."},
+                ]},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            formatter.render(&request, None).unwrap(),
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe.<|im_end|>\n\
+             <|im_start|>assistant\nA cat.<|im_end|>\n\
+             <|im_start|>user\nOne.Two.<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 }

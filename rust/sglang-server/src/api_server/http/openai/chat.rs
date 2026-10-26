@@ -1310,7 +1310,7 @@ mod tests {
                 core,
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
-                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter, false)),
                 generate_hook: None,
             });
             let responder = tokio::spawn(async move {

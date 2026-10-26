@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::message::types::OneOrMany;
 
-use super::template::{ChatFormatter, TemplateError};
+use super::template::{ChatFormatter, TemplateError, takes_content_parts};
 use super::template_builtins::builtin_template;
 use super::template_legacy::{LegacyFormatter, LegacySpec};
 
@@ -76,7 +76,7 @@ pub(super) fn load_chat_formatter(
             &model_type.map(str::to_lowercase),
             &model_path.unwrap_or_default().to_lowercase(),
         )
-        .map(ChatFormatter::HuggingFace),
+        .map(|formatter| ChatFormatter::HuggingFace(formatter, false)),
         Some(_) => None,
     };
 
@@ -273,6 +273,7 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     if template.chat_template.is_none() {
         return Err(TemplateError::Missing);
     }
+    let content_parts = takes_content_parts(&config["chat_template"].to_string());
     let formatter = PromptFormatter::from_parts(
         template,
         ContextMixins::new(&[PromptContextMixin::OaiChat]),
@@ -281,7 +282,7 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     .map_err(|error| TemplateError::Renderer {
         message: error.to_string(),
     })?;
-    Ok(ChatFormatter::HuggingFace(formatter))
+    Ok(ChatFormatter::HuggingFace(formatter, content_parts))
 }
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`
