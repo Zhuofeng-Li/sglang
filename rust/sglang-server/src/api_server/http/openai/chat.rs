@@ -32,6 +32,7 @@ use sglang_processor::{
 
 use super::completions::completion_usage;
 use super::pd_routing::PDRoutingFields;
+use super::template::ChatPrompt;
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media,
@@ -45,7 +46,7 @@ use crate::message::multimodal::MmItem;
 use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
-use crate::message::types::{OneOrMany, TokenIds};
+use crate::message::types::OneOrMany;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -291,15 +292,6 @@ fn chat_images<T: serde::Serialize>(
         .collect())
 }
 
-/// A rendered chat prompt. It is submitted as text — the tokenizer pool encodes
-/// it (with `skip_special_tokens`, since the template owns its special tokens) —
-/// unless its formatter encoded it, with its images in the formatter's order.
-pub(super) struct ChatPrompt {
-    text: String,
-    input_ids: Option<TokenIds>,
-    images: Option<Vec<MmItem>>,
-}
-
 /// Render the chat template for an OpenAI request, mapping a missing
 /// formatter or a render failure to the standard 400.
 pub(super) async fn prepare_chat_request(
@@ -319,19 +311,7 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = match formatter.encode(&request, kwargs) {
-        Some(encoded) => encoded.map(|encoded| ChatPrompt {
-            text: encoded.text,
-            input_ids: Some(encoded.ids.into_iter().map(i64::from).collect()),
-            images: Some(encoded.images.into_iter().map(MmItem::Source).collect()),
-        }),
-        None => formatter.render(&request, kwargs).map(|text| ChatPrompt {
-            text,
-            input_ids: None,
-            images: None,
-        }),
-    };
-    let prompt = prompt.map_err(|error| {
+    let prompt = formatter.prompt(&request, kwargs).await.map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),

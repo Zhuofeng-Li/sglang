@@ -8,13 +8,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, TextInput};
 use sglang_processor::EncodedPrompt;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
-use crate::message::types::OneOrMany;
+use crate::message::multimodal::MmItem;
+use crate::message::types::{OneOrMany, TokenIds};
 
 #[cfg(test)]
 pub(super) use super::template_builtins::builtin_template;
@@ -38,11 +41,43 @@ pub enum ChatFormatter {
     HuggingFace(PromptFormatter, bool),
     Legacy(Box<LegacyFormatter>),
     /// DeepSeek-V4 / V4.1 through deepseek-recipe, which encodes its own prompt ids.
-    DeepSeek(sglang_processor::ChatFormatter),
+    DeepSeek(DeepSeekFormatter),
+}
+
+/// A rendered chat prompt, with its ids and its images in placeholder order
+/// when the formatter encodes its own prompt.
+pub(super) struct ChatPrompt {
+    pub(super) text: String,
+    pub(super) input_ids: Option<TokenIds>,
+    pub(super) images: Option<Vec<MmItem>>,
 }
 
 impl ChatFormatter {
-    /// Render the request's messages to a single prompt string.
+    /// The request's chat prompt. A DeepSeek prompt is rendered and encoded
+    /// off the HTTP executor; the others render here and are encoded by the
+    /// tokenizer pool.
+    pub(super) async fn prompt(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+    ) -> Result<ChatPrompt, TemplateError> {
+        if let ChatFormatter::DeepSeek(formatter) = self {
+            let encoded = formatter.encode(recipe_request(request, kwargs)).await?;
+            return Ok(ChatPrompt {
+                text: encoded.text,
+                input_ids: Some(encoded.ids.into_iter().map(i64::from).collect()),
+                images: Some(encoded.images.into_iter().map(MmItem::Source).collect()),
+            });
+        }
+        Ok(ChatPrompt {
+            text: self.render(request, kwargs)?,
+            input_ids: None,
+            images: None,
+        })
+    }
+
+    /// Render the request's messages to a single prompt string, for the
+    /// formatters whose text the tokenizer pool encodes.
     pub(super) fn render(
         &self,
         request: &CreateChatCompletionRequest,
@@ -64,29 +99,11 @@ impl ChatFormatter {
                     })
             }
             ChatFormatter::Legacy(formatter) => formatter.render(request),
-            ChatFormatter::DeepSeek(formatter) => formatter
-                .render_request(recipe_request(request, kwargs), &HashMap::new())
-                .map(|(prompt, _)| prompt.into_text())
-                .map_err(|error| TemplateError::Renderer {
-                    message: error.to_string(),
-                }),
+            // Its text loses which segments may hold special tokens.
+            ChatFormatter::DeepSeek(_) => Err(TemplateError::Renderer {
+                message: "a DeepSeek prompt renders and encodes through `prompt`".into(),
+            }),
         }
-    }
-
-    /// The prompt ids and images of formatters that encode their own prompts.
-    pub(super) fn encode(
-        &self,
-        request: &CreateChatCompletionRequest,
-        kwargs: Option<&ChatTemplateKwargs>,
-    ) -> Option<Result<EncodedPrompt, TemplateError>> {
-        let ChatFormatter::DeepSeek(formatter) = self else {
-            return None;
-        };
-        let encoded = formatter
-            .encode_multimodal_request(recipe_request(request, kwargs), &HashMap::new())?;
-        Some(encoded.map_err(|error| TemplateError::Renderer {
-            message: error.to_string(),
-        }))
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -138,6 +155,47 @@ fn join_text_parts(
         messages: serde_json::from_value(messages).map_err(renderer_error)?,
         ..request.clone()
     })
+}
+
+/// deepseek-recipe's formatter. A long prompt takes the better part of a second
+/// to encode, so encodes run as blocking tasks, as many at once as the
+/// tokenizer pool has workers.
+#[derive(Clone)]
+pub struct DeepSeekFormatter {
+    formatter: Arc<sglang_processor::ChatFormatter>,
+    permits: Arc<Semaphore>,
+}
+
+impl DeepSeekFormatter {
+    pub(super) fn new(formatter: sglang_processor::ChatFormatter, max_encodes: usize) -> Self {
+        Self {
+            formatter: Arc::new(formatter),
+            permits: Arc::new(Semaphore::new(max_encodes.max(1))),
+        }
+    }
+
+    async fn encode(&self, body: serde_json::Value) -> Result<EncodedPrompt, TemplateError> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
+        let formatter = Arc::clone(&self.formatter);
+        let encoded = tokio::task::spawn_blocking(move || {
+            // Held by the blocking task: a dropped request cannot free its
+            // permit while its encode still runs.
+            let _permit = permit;
+            formatter
+                .encode_multimodal_request(body, &HashMap::new())
+                .map(|encoded| encoded.map_err(|error| error.to_string()))
+        })
+        .await;
+        let encoded = match encoded {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => Err("DeepSeek needs the checkpoint's tokenizer.json".into()),
+            Err(error) => Err(error.to_string()),
+        };
+        encoded.map_err(|message| TemplateError::Renderer { message })
+    }
 }
 
 /// The SGLang request body deepseek-recipe renders: the wire request plus its kwargs.
@@ -887,5 +945,18 @@ mod tests {
              <|im_start|>assistant\nA cat.<|im_end|>\n\
              <|im_start|>user\nOne.Two.<|im_end|>\n<|im_start|>assistant\n"
         );
+    }
+
+    /// A DeepSeek encode runs off the HTTP executor: on a current-thread
+    /// runtime, the handler awaiting it yields, so the encode cannot finish
+    /// before the executor next polls it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deepseek_encode_leaves_the_executor_free() {
+        let formatter = super::super::test_utils::deepseek_formatter();
+        let encode = tokio::spawn(async move { formatter.prompt(&request(), None).await });
+        tokio::task::yield_now().await;
+        assert!(!encode.is_finished(), "the encode ran on the executor");
+        let prompt = encode.await.unwrap().unwrap();
+        assert!(prompt.input_ids.is_some_and(|ids| !ids.is_empty()));
     }
 }

@@ -104,7 +104,12 @@ fn deepseek_chat_formatter(server_args: &ServerArgs) -> Option<Result<ChatFormat
             .and_then(|tokenizer| {
                 sglang_processor::ChatFormatter::deepseek_v4(v41, Some(&tokenizer))
             })
-            .map(ChatFormatter::DeepSeek),
+            .map(|formatter| {
+                ChatFormatter::DeepSeek(template::DeepSeekFormatter::new(
+                    formatter,
+                    server_args.tokenizer_worker_num,
+                ))
+            }),
     )
 }
 

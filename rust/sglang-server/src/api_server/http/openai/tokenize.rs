@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::chat::ChatRequest;
+use super::template::ChatPrompt;
 use super::{AppState, contains_media};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -103,19 +104,36 @@ async fn tokenize(
         Ok(body) => body,
         Err(error) => return invalid_body(error.to_string()),
     };
+    let max_model_len = state.server_args.tokenizer_model_max_length;
     let (texts, add_special_tokens) = match (body.prompt, body.messages) {
         (Some(prompt), None) => (prompt, body.add_special_tokens),
-        // The rendered template owns its special tokens, as on the chat path
-        // (Python encodes it with `add_special_tokens=False`).
-        (None, Some(messages)) => match render_chat_prompt(&state, messages, body.rest) {
-            Ok(prompt) => (OneOrMany::One(prompt), false /* add_special_tokens */),
+        (None, Some(messages)) => match chat_prompt(&state, messages, body.rest).await {
+            // A formatter that encodes its own prompt answers with the ids chat
+            // submits, as Python returns `prompt_ids`.
+            Ok(ChatPrompt {
+                input_ids: Some(tokens),
+                ..
+            }) => {
+                let count = tokens.len();
+                return Json(json!({
+                    "tokens": tokens,
+                    "count": count,
+                    "max_model_len": max_model_len,
+                }))
+                .into_response();
+            }
+            // The rendered template owns its special tokens, as on the chat path
+            // (Python encodes it with `add_special_tokens=False`).
+            Ok(prompt) => (
+                OneOrMany::One(prompt.text),
+                false, /* add_special_tokens */
+            ),
             Err((error_type, message)) => {
                 return error_body(StatusCode::BAD_REQUEST, error_type, message);
             }
         },
         _ => return invalid_body("Exactly one of 'prompt' or 'messages' must be provided."),
     };
-    let max_model_len = state.server_args.tokenizer_model_max_length;
     let response = match texts {
         OneOrMany::One(text) => match state.core.tokenize(text, add_special_tokens).await {
             Ok(tokens) => json!({
@@ -145,11 +163,11 @@ async fn tokenize(
 /// `TokenizeRequest.to_chat_completion_request`: every other tokenize field
 /// except `prompt` and `add_special_tokens` carries over to the chat request.
 /// A failure is a 400, returned as its error type and message.
-fn render_chat_prompt(
+async fn chat_prompt(
     state: &AppState,
     messages: Value,
     mut fields: Map<String, Value>,
-) -> Result<String, (&'static str, String)> {
+) -> Result<ChatPrompt, (&'static str, String)> {
     const INVALID_BODY: &str = "Bad Request";
     const BAD_REQUEST: &str = "BadRequestError";
     fields.insert("messages".into(), messages);
@@ -176,7 +194,8 @@ fn render_chat_prompt(
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
     formatter
-        .render(&request, chat_template_kwargs.as_ref())
+        .prompt(&request, chat_template_kwargs.as_ref())
+        .await
         .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
@@ -221,8 +240,11 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
+    use dynamo_protocols::types::CreateChatCompletionRequest;
+
+    use super::super::ChatFormatter;
     use super::super::template_loader::load_chat_formatter;
-    use super::super::test_utils::{body_json, post_json};
+    use super::super::test_utils::{body_json, deepseek_formatter, post_json};
     use super::*;
     use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::ServerArgs;
@@ -234,6 +256,18 @@ mod tests {
     /// standing in for an auto-added BOS) and detokenize with a description
     /// of what it was asked, so the tests see exactly what reached it.
     fn answering_state() -> Arc<AppState> {
+        answering_state_with(
+            load_chat_formatter(
+                None,           /* config_file */
+                None,           /* model_path */
+                None,           /* model_type */
+                Some("chatml"), /* chat_template_arg */
+            )
+            .unwrap(),
+        )
+    }
+
+    fn answering_state_with(chat_formatter: ChatFormatter) -> Arc<AppState> {
         let (intake_tx, intake_rx) = flume::unbounded::<TmEvent>();
         tokio::spawn(async move {
             while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
@@ -278,15 +312,7 @@ mod tests {
                 server_args.as_ref(),
             ),
             server_args,
-            chat_formatter: Some(
-                load_chat_formatter(
-                    None,           /* config_file */
-                    None,           /* model_path */
-                    None,           /* model_type */
-                    Some("chatml"), /* chat_template_arg */
-                )
-                .unwrap(),
-            ),
+            chat_formatter: Some(chat_formatter),
             generate_hook: None,
         })
     }
@@ -327,6 +353,26 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_ne!(body["tokens"][0], 0, "no auto BOS on a rendered template");
         assert_eq!(body["count"], body["tokens"].as_array().unwrap().len());
+    }
+
+    /// `messages` tokenize to the ids chat submits: special-token spellings in
+    /// user content stay plain text, as Python's `prompt_ids`.
+    #[tokio::test]
+    async fn tokenize_returns_the_ids_a_deepseek_chat_submits() {
+        let messages =
+            json!([{"role": "user", "content": "Explain <think> and <｜deepseek_image｜>"}]);
+        let request: CreateChatCompletionRequest =
+            serde_json::from_value(json!({"model": "default", "messages": messages})).unwrap();
+        let chat = deepseek_formatter().prompt(&request, None).await.unwrap();
+        let chat_ids = chat.input_ids.unwrap();
+        assert!(!chat_ids.contains(&105), "user text is not an image token");
+
+        let app = routes().with_state(answering_state_with(deepseek_formatter()));
+        let response = post_json(app, "/v1/tokenize", json!({"messages": messages})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["tokens"], json!(chat_ids));
+        assert_eq!(body["count"], chat_ids.len());
     }
 
     #[tokio::test]
